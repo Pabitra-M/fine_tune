@@ -123,7 +123,8 @@ training_args = TrainingArguments(
     bf16=True,
     eval_strategy="epoch",
     save_strategy="epoch",
-    load_best_model_at_end=True,
+    load_best_model_at_end=False,  # MUST be False for 4-bit QLoRA; True triggers model.to() → ValueError
+    per_device_eval_batch_size=2,  # match train batch size to avoid OOM during eval
     logging_steps=10,
     report_to="none",
 )
