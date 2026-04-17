@@ -1,10 +1,11 @@
-#QLoRA fine-tuning + evaluation
+#QLoRA fine-tuning + evaluation — Mistral-7B
 
 import json
 import math
 import torch
 import numpy as np
 import sacrebleu
+import subprocess
 from datasets import Dataset
 from transformers import (
     AutoTokenizer,
@@ -15,18 +16,39 @@ from transformers import (
 )
 import os
 from datetime import datetime
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from sklearn.model_selection import train_test_split
 
+# ── Memory environment setup (must happen before any CUDA calls) ──────────────
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+# Auto-select the GPU with the most free memory so we avoid saturated GPUs
+def _pick_best_gpu():
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index,memory.free",
+             "--format=csv,noheader,nounits"],
+            text=True
+        )
+        rows = [(int(r.split(",")[0]), int(r.split(",")[1].strip()))
+                for r in out.strip().splitlines()]
+        best = max(rows, key=lambda x: x[1])
+        print(f"[GPU] Auto-selected GPU {best[0]} ({best[1]} MiB free)")
+        return str(best[0])
+    except Exception:
+        return None  # fall back to default
 
+_gpu_id = _pick_best_gpu()
+if _gpu_id is not None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # CONFIG
 BASE_MODEL = "mistralai/Mistral-7B-v0.1"
 OUTPUT_DIR = "model/Mistral-7B_qa_model"
 DATA_PATH  = "all_dataset.json"
-MAX_LEN    = 256
+MAX_LEN    = 128   # Reduced from 256 → halves per-sample activation memory
 
 
 # LOAD DATA
@@ -93,13 +115,18 @@ bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_quant_type="nf4",
     bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
 )
 
+# Do NOT pass device_map — bitsandbytes manages GPU placement internally.
+# Passing device_map triggers dispatch_model → .to() which is illegal for 4-bit models.
 model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
     quantization_config=bnb_config,
-    device_map={"": 0},   # pin all layers to GPU 0; avoids .to() call that breaks 4-bit models
 )
+
+# Prepare model for k-bit training (freezes base weights, enables gradient checkpointing)
+model = prepare_model_for_kbit_training(model)
 
 lora_config = LoraConfig(
     r=8,
@@ -117,16 +144,18 @@ model = get_peft_model(model, lora_config)
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     num_train_epochs=2,
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=2,
+    per_device_train_batch_size=1,        # Reduced to 1 to save memory
+    gradient_accumulation_steps=4,        # Increased to maintain effective batch size
     learning_rate=2e-4,
     bf16=True,
     eval_strategy="epoch",
     save_strategy="epoch",
-    load_best_model_at_end=False,  # MUST be False for 4-bit QLoRA; True triggers model.to() → ValueError
-    per_device_eval_batch_size=2,  # match train batch size to avoid OOM during eval
+    load_best_model_at_end=False,         # MUST be False for 4-bit QLoRA
+    per_device_eval_batch_size=1,
     logging_steps=10,
     report_to="none",
+    gradient_checkpointing=True,          # Major VRAM saving during backprop
+    optim="paged_adamw_8bit",             # 8-bit optimizer states save memory
 )
 
 trainer = Trainer(
@@ -135,6 +164,12 @@ trainer = Trainer(
     train_dataset=train_ds,
     eval_dataset=val_ds,
 )
+
+# Flush any cached allocations before training begins
+torch.cuda.empty_cache()
+print(f"[GPU] Memory before training: "
+      f"{torch.cuda.memory_allocated()/1e9:.2f} GB allocated, "
+      f"{torch.cuda.memory_reserved()/1e9:.2f} GB reserved")
 
 print("Training started...")
 trainer.train()
