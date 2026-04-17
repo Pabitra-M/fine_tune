@@ -4,6 +4,7 @@ import json
 import math
 import torch
 import numpy as np
+import sacrebleu
 from datasets import Dataset
 from transformers import (
     AutoTokenizer,
@@ -20,9 +21,10 @@ from sklearn.model_selection import train_test_split
 
 
 
+
 # CONFIG
 BASE_MODEL = "tiiuae/falcon-7b"
-OUTPUT_DIR = "model/Llama-2_qa_model"
+OUTPUT_DIR = "model/falcon-7b_qa_model"
 DATA_PATH  = "all_dataset.json"
 MAX_LEN    = 256
 
@@ -53,6 +55,7 @@ val_ds   = Dataset.from_list(val_data)
 # TOKENIZER
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
 tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"   # required for causal LM fine-tuning
 
 
 def tokenize(example):
@@ -95,7 +98,7 @@ bnb_config = BitsAndBytesConfig(
 model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
     quantization_config=bnb_config,
-    device_map="auto",
+    device_map={"": 0},   # pin all layers to GPU 0; avoids .to() call that breaks 4-bit models
 )
 
 lora_config = LoraConfig(
@@ -118,9 +121,10 @@ training_args = TrainingArguments(
     gradient_accumulation_steps=2,
     learning_rate=2e-4,
     bf16=True,
-    evaluation_strategy="epoch",
+    eval_strategy="epoch",
     save_strategy="epoch",
-    load_best_model_at_end=True,
+    load_best_model_at_end=False,  # MUST be False for 4-bit QLoRA; True triggers model.to() → ValueError
+    per_device_eval_batch_size=2,  # match train batch size to avoid OOM during eval
     logging_steps=10,
     report_to="none",
 )
@@ -146,7 +150,7 @@ print(f"\nPerplexity: {perplexity:.2f}")
 
 # GENERATION-BASED METRICS
 def generate_answer(prompt):
-    inputs  = tokenizer(prompt, return_tensors="pt").to("cuda")
+    inputs  = tokenizer(prompt, return_tensors="pt").to(model.device)
     outputs = model.generate(**inputs, max_new_tokens=100, do_sample=False)
     text    = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return text.split("### Answer:")[-1].strip()

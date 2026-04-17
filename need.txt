@@ -17,3 +17,14 @@ if HF_TOKEN:
     print("✅ Hugging Face login successful")
 else:
     print("⚠️ No HF token found (will fail if model is gated)")
+
+
+
+
+
+
+    "tiiuae/falcon-7b"
+
+    "NousResearch/Meta-Llama-3-8B"
+
+    "mistralai/Mistral-7B-v0.1"
