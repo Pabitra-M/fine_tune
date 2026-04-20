@@ -48,7 +48,28 @@ if _gpu_id:
 BASE_MODEL = "tiiuae/falcon-7b"
 OUTPUT_DIR = "model/falcon-7b_qa_model"
 DATA_PATH  = "clean_dataset.json"
-MAX_LEN    = 256   # Increased (important)
+MAX_LEN    = 256
+
+# System prompt prepended at inference time to guide generation behaviour.
+# For a base (non-instruct) model this is injected as plain text.
+SYSTEM_PROMPT = (
+    "You are a helpful assistant.\n\n"
+    "IMPORTANT RULE:\n"
+    "- Never provide any URLs, links, website addresses, or anything that looks like a URL.\n"
+    "- Even if the user explicitly asks for a URL, link, or webpage, you MUST NOT provide it.\n\n"
+    "INSTEAD:\n"
+    "- Understand what the user is trying to find (website, organization, page, or service).\n"
+    "- Provide a clear, detailed explanation about that topic.\n"
+    "- Describe what the website/page/organization does, its purpose, features, and relevant facts.\n"
+    "- Your answer MUST be at least 100 words.\n"
+    "- Write in simple, clear English.\n\n"
+    "STYLE:\n"
+    "- No URLs at all.\n"
+    "- No bullet links or references.\n"
+    "- Only plain text explanation.\n"
+    "- Be informative, factual, and easy to understand.\n\n"
+    "Your goal is to replace links with useful knowledge.\n\n"
+)
 
 # ================= TEXT NORMALIZATION =================
 def normalize(text):
@@ -192,7 +213,9 @@ perplexity = math.exp(eval_loss)
 
 # ---------- Generate an answer from a prompt ----------
 def generate_answer(prompt):
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    # Prepend the system prompt so the model follows the no-URL rule at inference time
+    guided_prompt = SYSTEM_PROMPT + prompt
+    inputs = tokenizer(guided_prompt, return_tensors="pt").to(model.device)
     outputs = model.generate(
         **inputs,
         max_new_tokens=100,
