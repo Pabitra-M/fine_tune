@@ -150,17 +150,15 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
 )
 
-# Cap GPU memory usage to leave headroom for other processes.
-# Adjust the GiB value based on how much free memory you observed.
-_free_gib = 9  # conservative: use ~9 GiB out of the ~9.13 GiB observed free
-max_memory = {int(_gpu_id) if _gpu_id else 0: f"{_free_gib}GiB", "cpu": "48GiB"}
+# Force the entire model onto the single best GPU.
+# 4-bit BNB cannot offload layers to CPU — device_map="auto" causes a crash
+# when GPU RAM is shared. Using {"": gpu_id} keeps everything on one device.
+_gpu_idx = int(_gpu_id) if _gpu_id else 0
 
 model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
     quantization_config=bnb_config,
-    device_map="auto",        # distributes layers across GPU/CPU automatically
-    max_memory=max_memory,    # prevents allocating more than available VRAM
-    trust_remote_code=True,
+    device_map={"": _gpu_idx},   # all layers → single GPU, no CPU offload
 )
 
 model = prepare_model_for_kbit_training(model)
