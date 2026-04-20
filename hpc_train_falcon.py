@@ -45,7 +45,7 @@ if _gpu_id is not None:
 # CONFIG
 BASE_MODEL = "tiiuae/falcon-7b"
 OUTPUT_DIR = "model/falcon-7b_qa_model"
-DATA_PATH  = "all_dataset.json"
+DATA_PATH  = "clean_dataset.json"
 MAX_LEN    = 128   # Reduced from 256 → halves per-sample activation memory
 
 

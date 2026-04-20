@@ -47,7 +47,7 @@ if _gpu_id is not None:
 # CONFIG
 BASE_MODEL = "mistralai/Mistral-7B-v0.1"
 OUTPUT_DIR = "model/Mistral-7B_qa_model"
-DATA_PATH  = "all_dataset.json"
+DATA_PATH  = "clean_dataset.json"
 MAX_LEN    = 128   # Reduced from 256 → halves per-sample activation memory
 
 
