@@ -3,9 +3,6 @@
 import json
 import math
 import torch
-import numpy as np
-import sacrebleu
-import subprocess
 import re
 from collections import Counter
 from datasets import Dataset
@@ -23,6 +20,10 @@ from sklearn.model_selection import train_test_split
 
 # ================= GPU SETUP =================
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Suppress eetq-related advisory warnings (not applicable to bitsandbytes path)
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+# Disable caching allocator warmup — prevents the large OOM allocation
+os.environ["TRANSFORMERS_CACHE_ALLOCATOR_WARMUP"] = "0"
 
 def _pick_best_gpu():
     try:
@@ -128,13 +129,22 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
 )
 
+# Cap GPU memory usage to leave headroom for other processes.
+# Adjust the GiB value based on how much free memory you observed.
+_free_gib = 9  # conservative: use ~9 GiB out of the ~9.13 GiB observed free
+max_memory = {int(_gpu_id) if _gpu_id else 0: f"{_free_gib}GiB", "cpu": "48GiB"}
+
 model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
     quantization_config=bnb_config,
+    device_map="auto",        # distributes layers across GPU/CPU automatically
+    max_memory=max_memory,    # prevents allocating more than available VRAM
     trust_remote_code=True,
 )
 
 model = prepare_model_for_kbit_training(model)
+# Falcon uses use_cache=True by default — must disable for gradient checkpointing
+model.config.use_cache = False
 
 lora_config = LoraConfig(
     r=8,
@@ -180,77 +190,48 @@ print("\nEvaluating...")
 eval_loss = trainer.evaluate()["eval_loss"]
 perplexity = math.exp(eval_loss)
 
-# ---------- Generation ----------
+# ---------- Generate an answer from a prompt ----------
 def generate_answer(prompt):
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
     outputs = model.generate(
         **inputs,
         max_new_tokens=100,
-        do_sample=False
+        do_sample=False,
     )
-
     text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-    answer = text.split("### Answer:")[-1]
-    answer = answer.split("\n")[0]
-
+    answer = text.split("### Answer:")[-1].split("\n")[0]
     return normalize(answer)
 
-# ---------- Metrics ----------
-def token_overlap_accuracy(pred_tokens, true_tokens):
-    overlap = set(pred_tokens) & set(true_tokens)
-    return len(overlap) / max(len(true_tokens), 1)
-
-def compute_f1(pred_tokens, true_tokens):
-    pred_counter = Counter(pred_tokens)
-    true_counter = Counter(true_tokens)
-
-    common = pred_counter & true_counter
-    num_same = sum(common.values())
-
-    if num_same == 0:
+# ---------- Token-level F1 (best simple accuracy for QA) ----------
+def compute_f1(pred, true):
+    pred_tokens = Counter(pred.split())
+    true_tokens = Counter(true.split())
+    common = sum((pred_tokens & true_tokens).values())
+    if common == 0:
         return 0.0
-
-    precision = num_same / len(pred_tokens)
-    recall = num_same / len(true_tokens)
-
+    precision = common / sum(pred_tokens.values())
+    recall    = common / sum(true_tokens.values())
     return 2 * precision * recall / (precision + recall)
 
-# ---------- Loop ----------
+# ---------- Evaluation loop ----------
 exact_match = 0
-token_accs = []
-f1_scores = []
-all_preds = []
-all_refs = []
+f1_scores   = []
 
-for sample in val_data[:50]:
+samples = val_data[:50]
+for sample in samples:
     pred = generate_answer(sample["prompt"])
     true = normalize(sample["answer"])
 
-    pred_tokens = pred.split()
-    true_tokens = true.split()
-
     if pred == true:
         exact_match += 1
+    f1_scores.append(compute_f1(pred, true))
 
-    token_accs.append(token_overlap_accuracy(pred_tokens, true_tokens))
-    f1_scores.append(compute_f1(pred_tokens, true_tokens))
+em_score = exact_match / len(samples)
+f1_avg   = sum(f1_scores) / len(f1_scores)
 
-    all_preds.append(pred)
-    all_refs.append(true)
-
-# ---------- Final Scores ----------
-em_score = exact_match / len(val_data[:50])
-token_acc = float(np.mean(token_accs))
-f1_avg = float(np.mean(f1_scores))
-bleu_avg = sacrebleu.corpus_bleu(all_preds, [all_refs]).score / 100
-
-print(f"\nPerplexity           : {perplexity:.3f}")
-print(f"Exact Match          : {em_score:.3f}")
-print(f"Token Overlap Acc    : {token_acc:.3f}")
-print(f"F1 Score             : {f1_avg:.3f}")
-print(f"BLEU Score           : {bleu_avg:.3f}")
+print(f"\nPerplexity  : {perplexity:.3f}")
+print(f"Token F1    : {f1_avg:.3f}   ← main accuracy signal")
+print(f"Exact Match : {em_score:.3f}")
 
 # ================= SAVE =================
 model.save_pretrained(OUTPUT_DIR)
@@ -263,11 +244,9 @@ results = {
     "model_name": BASE_MODEL,
     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     "metrics": {
-        "perplexity": float(perplexity),
-        "exact_match": float(em_score),
-        "token_accuracy": token_acc,
-        "f1_score": f1_avg,
-        "bleu_score": bleu_avg,
+        "perplexity":   round(float(perplexity), 4),
+        "token_f1":     round(float(f1_avg),     4),
+        "exact_match":  round(float(em_score),   4),
     },
 }
 
