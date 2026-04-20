@@ -22,26 +22,53 @@ from sklearn.model_selection import train_test_split
 # ── Memory environment setup (must happen before any CUDA calls) ──────────────
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# Auto-select the GPU with the most free memory so we avoid saturated GPUs
-def _pick_best_gpu():
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,memory.free",
-             "--format=csv,noheader,nounits"],
-            text=True
-        )
-        rows = [(int(r.split(",")[0]), int(r.split(",")[1].strip()))
-                for r in out.strip().splitlines()]
-        best = max(rows, key=lambda x: x[1])
-        print(f"[GPU] Auto-selected GPU {best[0]} ({best[1]} MiB free)")
-        return str(best[0])
-    except Exception:
-        return None  # fall back to default
+# Minimum free VRAM required before the script is allowed to start.
+# Llama-2-7B in 4-bit needs ~5 GiB; 8 GiB gives comfortable headroom.
+MIN_FREE_MIB   = 8_000   # MiB  — raise/lower based on your cluster
+POLL_INTERVAL  = 60      # seconds between each GPU-memory check
 
-_gpu_id = _pick_best_gpu()
-if _gpu_id is not None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
+def _wait_for_gpu(min_free_mib: int = MIN_FREE_MIB,
+                  poll_interval: int = POLL_INTERVAL) -> str:
+    """
+    Block until a GPU with at least `min_free_mib` MiB free is available.
+    Returns the GPU index as a string.  Never raises — retries forever.
+    """
+    import time
+    attempt = 0
+    while True:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index,memory.free",
+                 "--format=csv,noheader,nounits"],
+                text=True
+            )
+            rows = [
+                (int(r.split(",")[0]), int(r.split(",")[1].strip()))
+                for r in out.strip().splitlines()
+            ]
+            # Pick the GPU with the most free memory
+            best_idx, best_free = max(rows, key=lambda x: x[1])
+
+            if best_free >= min_free_mib:
+                print(f"[GPU] ✅ GPU {best_idx} ready — "
+                      f"{best_free} MiB free (need {min_free_mib} MiB). Starting now.")
+                return str(best_idx)
+            else:
+                attempt += 1
+                print(f"[GPU] ⏳ Attempt {attempt}: best GPU {best_idx} only has "
+                      f"{best_free} MiB free (need {min_free_mib} MiB). "
+                      f"Waiting {poll_interval}s ...")
+                time.sleep(poll_interval)
+
+        except Exception as e:
+            print(f"[GPU] ⚠️  nvidia-smi failed ({e}). Retrying in {poll_interval}s ...")
+            import time
+            time.sleep(poll_interval)
+
+_gpu_id = _wait_for_gpu()
+os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 
 

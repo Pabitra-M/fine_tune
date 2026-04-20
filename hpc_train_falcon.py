@@ -3,6 +3,9 @@
 import json
 import math
 import torch
+import numpy as np
+import sacrebleu
+import subprocess
 import re
 from collections import Counter
 from datasets import Dataset
@@ -20,10 +23,6 @@ from sklearn.model_selection import train_test_split
 
 # ================= GPU SETUP =================
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-# Suppress eetq-related advisory warnings (not applicable to bitsandbytes path)
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
-# Disable caching allocator warmup — prevents the large OOM allocation
-os.environ["TRANSFORMERS_CACHE_ALLOCATOR_WARMUP"] = "0"
 
 def _pick_best_gpu():
     try:
@@ -48,28 +47,7 @@ if _gpu_id:
 BASE_MODEL = "tiiuae/falcon-7b"
 OUTPUT_DIR = "model/falcon-7b_qa_model"
 DATA_PATH  = "clean_dataset.json"
-MAX_LEN    = 256
-
-# System prompt prepended at inference time to guide generation behaviour.
-# For a base (non-instruct) model this is injected as plain text.
-SYSTEM_PROMPT = (
-    "You are a helpful assistant.\n\n"
-    "IMPORTANT RULE:\n"
-    "- Never provide any URLs, links, website addresses, or anything that looks like a URL.\n"
-    "- Even if the user explicitly asks for a URL, link, or webpage, you MUST NOT provide it.\n\n"
-    "INSTEAD:\n"
-    "- Understand what the user is trying to find (website, organization, page, or service).\n"
-    "- Provide a clear, detailed explanation about that topic.\n"
-    "- Describe what the website/page/organization does, its purpose, features, and relevant facts.\n"
-    "- Your answer MUST be at least 100 words.\n"
-    "- Write in simple, clear English.\n\n"
-    "STYLE:\n"
-    "- No URLs at all.\n"
-    "- No bullet links or references.\n"
-    "- Only plain text explanation.\n"
-    "- Be informative, factual, and easy to understand.\n\n"
-    "Your goal is to replace links with useful knowledge.\n\n"
-)
+MAX_LEN    = 256   # Increased (important)
 
 # ================= TEXT NORMALIZATION =================
 def normalize(text):
@@ -150,20 +128,13 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
 )
 
-# Force the entire model onto the single best GPU.
-# 4-bit BNB cannot offload layers to CPU — device_map="auto" causes a crash
-# when GPU RAM is shared. Using {"": gpu_id} keeps everything on one device.
-_gpu_idx = int(_gpu_id) if _gpu_id else 0
-
 model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
     quantization_config=bnb_config,
-    device_map={"": _gpu_idx},   # all layers → single GPU, no CPU offload
+    trust_remote_code=True,
 )
 
 model = prepare_model_for_kbit_training(model)
-# Falcon uses use_cache=True by default — must disable for gradient checkpointing
-model.config.use_cache = False
 
 lora_config = LoraConfig(
     r=8,
@@ -209,50 +180,77 @@ print("\nEvaluating...")
 eval_loss = trainer.evaluate()["eval_loss"]
 perplexity = math.exp(eval_loss)
 
-# ---------- Generate an answer from a prompt ----------
+# ---------- Generation ----------
 def generate_answer(prompt):
-    # Prepend the system prompt so the model follows the no-URL rule at inference time
-    guided_prompt = SYSTEM_PROMPT + prompt
-    inputs = tokenizer(guided_prompt, return_tensors="pt").to(model.device)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
     outputs = model.generate(
         **inputs,
         max_new_tokens=100,
-        do_sample=False,
+        do_sample=False
     )
+
     text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    answer = text.split("### Answer:")[-1].split("\n")[0]
+
+    answer = text.split("### Answer:")[-1]
+    answer = answer.split("\n")[0]
+
     return normalize(answer)
 
-# ---------- Token-level F1 (best simple accuracy for QA) ----------
-def compute_f1(pred, true):
-    pred_tokens = Counter(pred.split())
-    true_tokens = Counter(true.split())
-    common = sum((pred_tokens & true_tokens).values())
-    if common == 0:
+# ---------- Metrics ----------
+def token_overlap_accuracy(pred_tokens, true_tokens):
+    overlap = set(pred_tokens) & set(true_tokens)
+    return len(overlap) / max(len(true_tokens), 1)
+
+def compute_f1(pred_tokens, true_tokens):
+    pred_counter = Counter(pred_tokens)
+    true_counter = Counter(true_tokens)
+
+    common = pred_counter & true_counter
+    num_same = sum(common.values())
+
+    if num_same == 0:
         return 0.0
-    precision = common / sum(pred_tokens.values())
-    recall    = common / sum(true_tokens.values())
+
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(true_tokens)
+
     return 2 * precision * recall / (precision + recall)
 
-# ---------- Evaluation loop ----------
+# ---------- Loop ----------
 exact_match = 0
-f1_scores   = []
+token_accs = []
+f1_scores = []
+all_preds = []
+all_refs = []
 
-samples = val_data[:50]
-for sample in samples:
+for sample in val_data[:50]:
     pred = generate_answer(sample["prompt"])
     true = normalize(sample["answer"])
 
+    pred_tokens = pred.split()
+    true_tokens = true.split()
+
     if pred == true:
         exact_match += 1
-    f1_scores.append(compute_f1(pred, true))
 
-em_score = exact_match / len(samples)
-f1_avg   = sum(f1_scores) / len(f1_scores)
+    token_accs.append(token_overlap_accuracy(pred_tokens, true_tokens))
+    f1_scores.append(compute_f1(pred_tokens, true_tokens))
 
-print(f"\nPerplexity  : {perplexity:.3f}")
-print(f"Token F1    : {f1_avg:.3f}   ← main accuracy signal")
-print(f"Exact Match : {em_score:.3f}")
+    all_preds.append(pred)
+    all_refs.append(true)
+
+# ---------- Final Scores ----------
+em_score = exact_match / len(val_data[:50])
+token_acc = float(np.mean(token_accs))
+f1_avg = float(np.mean(f1_scores))
+bleu_avg = sacrebleu.corpus_bleu(all_preds, [all_refs]).score / 100
+
+print(f"\nPerplexity           : {perplexity:.3f}")
+print(f"Exact Match          : {em_score:.3f}")
+print(f"Token Overlap Acc    : {token_acc:.3f}")
+print(f"F1 Score             : {f1_avg:.3f}")
+print(f"BLEU Score           : {bleu_avg:.3f}")
 
 # ================= SAVE =================
 model.save_pretrained(OUTPUT_DIR)
@@ -265,9 +263,11 @@ results = {
     "model_name": BASE_MODEL,
     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     "metrics": {
-        "perplexity":   round(float(perplexity), 4),
-        "token_f1":     round(float(f1_avg),     4),
-        "exact_match":  round(float(em_score),   4),
+        "perplexity": float(perplexity),
+        "exact_match": float(em_score),
+        "token_accuracy": token_acc,
+        "f1_score": f1_avg,
+        "bleu_score": bleu_avg,
     },
 }
 
