@@ -1,4 +1,4 @@
-#QLoRA fine-tuning + evaluation — Meta-Llama-3-8B
+#QLoRA fine-tuning + evaluation
 
 import json
 import math
@@ -19,32 +19,64 @@ from datetime import datetime
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from sklearn.model_selection import train_test_split
 
-# ── Memory env setup (must happen before any CUDA calls) ─────────────────────
+# ── Memory environment setup (must happen before any CUDA calls) ──────────────
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-def _pick_best_gpu():
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,memory.free",
-             "--format=csv,noheader,nounits"],
-            text=True
-        )
-        rows = [(int(r.split(",")[0]), int(r.split(",")[1].strip()))
-                for r in out.strip().splitlines()]
-        best = max(rows, key=lambda x: x[1])
-        print(f"[GPU] Auto-selected GPU {best[0]} ({best[1]} MiB free)")
-        return str(best[0])
-    except Exception:
-        return None
+# Minimum free VRAM required before the script is allowed to start.
+# Llama-2-7B in 4-bit needs ~5 GiB; 8 GiB gives comfortable headroom.
+MIN_FREE_MIB   = 8_000   # MiB  — raise/lower based on your cluster
+POLL_INTERVAL  = 60      # seconds between each GPU-memory check
 
-_gpu_id = _pick_best_gpu()
-if _gpu_id is not None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
+def _wait_for_gpu(min_free_mib: int = MIN_FREE_MIB,
+                  poll_interval: int = POLL_INTERVAL) -> str:
+    """
+    Block until a GPU with at least `min_free_mib` MiB free is available.
+    Returns the GPU index as a string.  Never raises — retries forever.
+    """
+    import time
+    attempt = 0
+    while True:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index,memory.free",
+                 "--format=csv,noheader,nounits"],
+                text=True
+            )
+            rows = [
+                (int(r.split(",")[0]), int(r.split(",")[1].strip()))
+                for r in out.strip().splitlines()
+            ]
+            # Pick the GPU with the most free memory
+            best_idx, best_free = max(rows, key=lambda x: x[1])
+
+            if best_free >= min_free_mib:
+                print(f"[GPU] ✅ GPU {best_idx} ready — "
+                      f"{best_free} MiB free (need {min_free_mib} MiB). Starting now.")
+                return str(best_idx)
+            else:
+                attempt += 1
+                print(f"[GPU] ⏳ Attempt {attempt}: best GPU {best_idx} only has "
+                      f"{best_free} MiB free (need {min_free_mib} MiB). "
+                      f"Waiting {poll_interval}s ...")
+                time.sleep(poll_interval)
+
+        except Exception as e:
+            print(f"[GPU] ⚠️  nvidia-smi failed ({e}). Retrying in {poll_interval}s ...")
+            import time
+            time.sleep(poll_interval)
+
+_gpu_id = _wait_for_gpu()
+os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
 
 # CONFIG
 BASE_MODEL = "NousResearch/Meta-Llama-3-8B"
-OUTPUT_DIR = "model/Llama-3_qa_model"
+OUTPUT_DIR = "model/Llama-2_qa_model"
 DATA_PATH  = "clean_dataset.json"
 MAX_LEN    = 128   # Reduced from 256 → halves per-sample activation memory
 
@@ -53,6 +85,7 @@ MAX_LEN    = 128   # Reduced from 256 → halves per-sample activation memory
 def load_data(path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
+
     records = []
     for item in data:
         q = item.get("question", "").strip()
@@ -74,7 +107,7 @@ val_ds   = Dataset.from_list(val_data)
 # TOKENIZER
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
 tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "right"
+tokenizer.padding_side = "right"   # required for causal LM fine-tuning
 
 
 def tokenize(example):
@@ -84,12 +117,15 @@ def tokenize(example):
         padding="max_length",
         max_length=MAX_LEN,
     )
+
+    # mask prompt tokens with -100 so loss is only computed on the answer
     prompt_tokens = tokenizer(
         example["prompt"],
         truncation=True,
         max_length=MAX_LEN,
     )
     prompt_len = len(prompt_tokens["input_ids"])
+
     labels = tokens["input_ids"].copy()
     labels[:prompt_len] = [-100] * prompt_len
     labels = [
@@ -112,11 +148,14 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
 )
 
-# No device_map: bitsandbytes handles GPU placement; device_map triggers .to() crash
+# Do NOT pass device_map here — bitsandbytes manages GPU placement internally.
+# Passing device_map triggers dispatch_model → .to() which is illegal for 4/8-bit models.
 model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
     quantization_config=bnb_config,
 )
+
+# Prepare model for k-bit training (freezes base weights, enables gradient checkpointing)
 model = prepare_model_for_kbit_training(model)
 
 lora_config = LoraConfig(
@@ -127,6 +166,7 @@ lora_config = LoraConfig(
     bias="none",
     task_type="CAUSAL_LM",
 )
+
 model = get_peft_model(model, lora_config)
 
 
@@ -134,18 +174,18 @@ model = get_peft_model(model, lora_config)
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     num_train_epochs=2,
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=4,
+    per_device_train_batch_size=1,        # Reduced from 2 to 1 to save memory
+    gradient_accumulation_steps=4,        # Increased from 2 to 4 to maintain effective batch size
     learning_rate=2e-4,
     bf16=True,
     eval_strategy="epoch",
     save_strategy="epoch",
-    load_best_model_at_end=False,
-    per_device_eval_batch_size=1,
+    load_best_model_at_end=False,  
+    per_device_eval_batch_size=1,         # Reduced to match train
     logging_steps=10,
     report_to="none",
-    gradient_checkpointing=True,
-    optim="paged_adamw_8bit",
+    gradient_checkpointing=True,          # MASSIVE memory saving during training
+    optim="paged_adamw_8bit",             # Uses 8-bit optimizer states to save memory
 )
 
 trainer = Trainer(
@@ -155,6 +195,7 @@ trainer = Trainer(
     eval_dataset=val_ds,
 )
 
+# Flush any cached allocations before training begins
 torch.cuda.empty_cache()
 print(f"[GPU] Memory before training: "
       f"{torch.cuda.memory_allocated()/1e9:.2f} GB allocated, "
@@ -166,13 +207,35 @@ trainer.train()
 
 # EVALUATION
 print("\nRunning evaluation...")
+
 eval_loss  = trainer.evaluate()["eval_loss"]
 perplexity = math.exp(eval_loss)
 print(f"\nPerplexity: {perplexity:.2f}")
 
 
+# GENERATION-BASED METRICS
+SYSTEM_PROMPT = (
+    "You are a helpful assistant.\n\n"
+    "IMPORTANT RULE:\n"
+    "- Never provide any URLs, links, website addresses, or anything that looks like a URL.\n"
+    "- Even if the user explicitly asks for a URL, link, or webpage, you MUST NOT provide it.\n\n"
+    "INSTEAD:\n"
+    "- Understand what the user is trying to find (website, organization, page, or service).\n"
+    "- Provide a clear, detailed explanation about that topic.\n"
+    "- Describe what the website/page/organization does, its purpose, features, and relevant facts.\n"
+    "- Your answer MUST be at least 100 words.\n"
+    "- Write in simple, clear English.\n\n"
+    "STYLE:\n"
+    "- No URLs at all.\n"
+    "- No bullet links or references.\n"
+    "- Only plain text explanation.\n"
+    "- Be informative, factual, and easy to understand.\n\n"
+    "Your goal is to replace links with useful knowledge.\n\n"
+)
+
 def generate_answer(prompt):
-    inputs  = tokenizer(prompt, return_tensors="pt").to(model.device)
+    guided_prompt = SYSTEM_PROMPT + prompt          # ← only change: prepend system prompt
+    inputs  = tokenizer(guided_prompt, return_tensors="pt").to(model.device)
     outputs = model.generate(**inputs, max_new_tokens=100, do_sample=False)
     text    = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return text.split("### Answer:")[-1].strip()
@@ -201,18 +264,29 @@ for sample in val_data[:50]:
     true        = sample["answer"]
     pred_tokens = pred.split()
     true_tokens = true.split()
+
+    # Exact match
     if pred.strip() == true.strip():
         exact_match += 1
+
+    # Token accuracy (positional)
     match = sum(p == t for p, t in zip(pred_tokens, true_tokens))
     token_accs.append(match / max(len(true_tokens), 1))
+
+    # F1
     f1_scores.append(compute_f1(pred_tokens, true_tokens))
+
+    # Collect for corpus-level BLEU
     all_preds.append(pred)
     all_refs.append(true)
+
 
 em_score  = exact_match / len(val_data[:50])
 token_acc = float(np.mean(token_accs))
 f1_avg    = float(np.mean(f1_scores))
-bleu_avg  = sacrebleu.corpus_bleu(all_preds, [all_refs]).score / 100
+
+# Corpus-level BLEU via sacrebleu (normalized to 0-1)
+bleu_avg = sacrebleu.corpus_bleu(all_preds, [all_refs]).score / 100
 
 print(f"\n✅ Exact Match Accuracy : {em_score:.3f}")
 print(f"✅ Token Accuracy        : {token_acc:.3f}")

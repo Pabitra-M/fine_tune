@@ -1,4 +1,4 @@
-#QLoRA fine-tuning + evaluation — Mistral-7B
+#QLoRA fine-tuning + evaluation
 
 import json
 import math
@@ -22,31 +22,61 @@ from sklearn.model_selection import train_test_split
 # ── Memory environment setup (must happen before any CUDA calls) ──────────────
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# Auto-select the GPU with the most free memory so we avoid saturated GPUs
-def _pick_best_gpu():
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,memory.free",
-             "--format=csv,noheader,nounits"],
-            text=True
-        )
-        rows = [(int(r.split(",")[0]), int(r.split(",")[1].strip()))
-                for r in out.strip().splitlines()]
-        best = max(rows, key=lambda x: x[1])
-        print(f"[GPU] Auto-selected GPU {best[0]} ({best[1]} MiB free)")
-        return str(best[0])
-    except Exception:
-        return None  # fall back to default
+# Minimum free VRAM required before the script is allowed to start.
+# Llama-2-7B in 4-bit needs ~5 GiB; 8 GiB gives comfortable headroom.
+MIN_FREE_MIB   = 8_000   # MiB  — raise/lower based on your cluster
+POLL_INTERVAL  = 60      # seconds between each GPU-memory check
 
-_gpu_id = _pick_best_gpu()
-if _gpu_id is not None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
+def _wait_for_gpu(min_free_mib: int = MIN_FREE_MIB,
+                  poll_interval: int = POLL_INTERVAL) -> str:
+    """
+    Block until a GPU with at least `min_free_mib` MiB free is available.
+    Returns the GPU index as a string.  Never raises — retries forever.
+    """
+    import time
+    attempt = 0
+    while True:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index,memory.free",
+                 "--format=csv,noheader,nounits"],
+                text=True
+            )
+            rows = [
+                (int(r.split(",")[0]), int(r.split(",")[1].strip()))
+                for r in out.strip().splitlines()
+            ]
+            # Pick the GPU with the most free memory
+            best_idx, best_free = max(rows, key=lambda x: x[1])
+
+            if best_free >= min_free_mib:
+                print(f"[GPU] ✅ GPU {best_idx} ready — "
+                      f"{best_free} MiB free (need {min_free_mib} MiB). Starting now.")
+                return str(best_idx)
+            else:
+                attempt += 1
+                print(f"[GPU] ⏳ Attempt {attempt}: best GPU {best_idx} only has "
+                      f"{best_free} MiB free (need {min_free_mib} MiB). "
+                      f"Waiting {poll_interval}s ...")
+                time.sleep(poll_interval)
+
+        except Exception as e:
+            print(f"[GPU] ⚠️  nvidia-smi failed ({e}). Retrying in {poll_interval}s ...")
+            import time
+            time.sleep(poll_interval)
+
+_gpu_id = _wait_for_gpu()
+os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+
+
 
 
 # CONFIG
 BASE_MODEL = "mistralai/Mistral-7B-v0.1"
-OUTPUT_DIR = "model/Mistral-7B_qa_model"
+OUTPUT_DIR = "model/Llama-2_qa_model"
 DATA_PATH  = "clean_dataset.json"
 MAX_LEN    = 128   # Reduced from 256 → halves per-sample activation memory
 
@@ -118,8 +148,8 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
 )
 
-# Do NOT pass device_map — bitsandbytes manages GPU placement internally.
-# Passing device_map triggers dispatch_model → .to() which is illegal for 4-bit models.
+# Do NOT pass device_map here — bitsandbytes manages GPU placement internally.
+# Passing device_map triggers dispatch_model → .to() which is illegal for 4/8-bit models.
 model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
     quantization_config=bnb_config,
@@ -144,18 +174,18 @@ model = get_peft_model(model, lora_config)
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     num_train_epochs=2,
-    per_device_train_batch_size=1,        # Reduced to 1 to save memory
-    gradient_accumulation_steps=4,        # Increased to maintain effective batch size
+    per_device_train_batch_size=1,        # Reduced from 2 to 1 to save memory
+    gradient_accumulation_steps=4,        # Increased from 2 to 4 to maintain effective batch size
     learning_rate=2e-4,
     bf16=True,
     eval_strategy="epoch",
     save_strategy="epoch",
-    load_best_model_at_end=False,         # MUST be False for 4-bit QLoRA
-    per_device_eval_batch_size=1,
+    load_best_model_at_end=False,  
+    per_device_eval_batch_size=1,         # Reduced to match train
     logging_steps=10,
     report_to="none",
-    gradient_checkpointing=True,          # Major VRAM saving during backprop
-    optim="paged_adamw_8bit",             # 8-bit optimizer states save memory
+    gradient_checkpointing=True,          # MASSIVE memory saving during training
+    optim="paged_adamw_8bit",             # Uses 8-bit optimizer states to save memory
 )
 
 trainer = Trainer(
@@ -184,8 +214,28 @@ print(f"\nPerplexity: {perplexity:.2f}")
 
 
 # GENERATION-BASED METRICS
+SYSTEM_PROMPT = (
+    "You are a helpful assistant.\n\n"
+    "IMPORTANT RULE:\n"
+    "- Never provide any URLs, links, website addresses, or anything that looks like a URL.\n"
+    "- Even if the user explicitly asks for a URL, link, or webpage, you MUST NOT provide it.\n\n"
+    "INSTEAD:\n"
+    "- Understand what the user is trying to find (website, organization, page, or service).\n"
+    "- Provide a clear, detailed explanation about that topic.\n"
+    "- Describe what the website/page/organization does, its purpose, features, and relevant facts.\n"
+    "- Your answer MUST be at least 100 words.\n"
+    "- Write in simple, clear English.\n\n"
+    "STYLE:\n"
+    "- No URLs at all.\n"
+    "- No bullet links or references.\n"
+    "- Only plain text explanation.\n"
+    "- Be informative, factual, and easy to understand.\n\n"
+    "Your goal is to replace links with useful knowledge.\n\n"
+)
+
 def generate_answer(prompt):
-    inputs  = tokenizer(prompt, return_tensors="pt").to(model.device)
+    guided_prompt = SYSTEM_PROMPT + prompt          # ← only change: prepend system prompt
+    inputs  = tokenizer(guided_prompt, return_tensors="pt").to(model.device)
     outputs = model.generate(**inputs, max_new_tokens=100, do_sample=False)
     text    = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return text.split("### Answer:")[-1].strip()
