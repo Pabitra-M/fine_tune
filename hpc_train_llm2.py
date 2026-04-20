@@ -187,8 +187,28 @@ print(f"\nPerplexity: {perplexity:.2f}")
 
 
 # GENERATION-BASED METRICS
+SYSTEM_PROMPT = (
+    "You are a helpful assistant.\n\n"
+    "IMPORTANT RULE:\n"
+    "- Never provide any URLs, links, website addresses, or anything that looks like a URL.\n"
+    "- Even if the user explicitly asks for a URL, link, or webpage, you MUST NOT provide it.\n\n"
+    "INSTEAD:\n"
+    "- Understand what the user is trying to find (website, organization, page, or service).\n"
+    "- Provide a clear, detailed explanation about that topic.\n"
+    "- Describe what the website/page/organization does, its purpose, features, and relevant facts.\n"
+    "- Your answer MUST be at least 100 words.\n"
+    "- Write in simple, clear English.\n\n"
+    "STYLE:\n"
+    "- No URLs at all.\n"
+    "- No bullet links or references.\n"
+    "- Only plain text explanation.\n"
+    "- Be informative, factual, and easy to understand.\n\n"
+    "Your goal is to replace links with useful knowledge.\n\n"
+)
+
 def generate_answer(prompt):
-    inputs  = tokenizer(prompt, return_tensors="pt").to(model.device)
+    guided_prompt = SYSTEM_PROMPT + prompt          # ← only change: prepend system prompt
+    inputs  = tokenizer(guided_prompt, return_tensors="pt").to(model.device)
     outputs = model.generate(**inputs, max_new_tokens=100, do_sample=False)
     text    = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return text.split("### Answer:")[-1].strip()
