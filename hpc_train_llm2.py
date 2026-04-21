@@ -2,6 +2,7 @@
 
 import json
 import math
+import re
 import torch
 import numpy as np
 import sacrebleu
@@ -188,11 +189,23 @@ training_args = TrainingArguments(
     optim="paged_adamw_8bit",             # Uses 8-bit optimizer states to save memory
 )
 
+# Simple token-level accuracy: how many predicted tokens match true tokens
+# (ignores padding / prompt tokens marked with -100)
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    predictions = np.argmax(logits, axis=-1)   # shape: (batch, seq_len)
+    mask    = labels != -100                   # ignore padding & prompt tokens
+    correct = (predictions == labels) & mask
+    accuracy = correct.sum() / mask.sum() if mask.sum() > 0 else 0.0
+    return {"accuracy": float(accuracy)}
+
+
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_ds,
     eval_dataset=val_ds,
+    compute_metrics=compute_metrics,           # ← simple match accuracy
 )
 
 # Flush any cached allocations before training begins
@@ -241,6 +254,11 @@ def generate_answer(prompt):
     return text.split("### Answer:")[-1].strip()
 
 
+def normalize(text):
+    """Lowercase and remove punctuation for fair comparison."""
+    return re.sub(r'[^\w\s]', '', text.lower()).strip()
+
+
 def compute_f1(pred_tokens, true_tokens):
     """Token-overlap F1 (same as SQuAD metric)."""
     pred_set = set(pred_tokens)
@@ -253,25 +271,27 @@ def compute_f1(pred_tokens, true_tokens):
     return 2 * precision * recall / (precision + recall)
 
 
-exact_match = 0
-token_accs  = []
-f1_scores   = []
-all_preds   = []
-all_refs    = []
+norm_match    = 0   # normalized match  (ignores case + punctuation)
+contains_match = 0  # true answer found inside prediction
+f1_scores     = []
+all_preds     = []
+all_refs      = []
 
 for sample in val_data[:50]:
     pred        = generate_answer(sample["prompt"])
     true        = sample["answer"]
-    pred_tokens = pred.split()
-    true_tokens = true.split()
+    pred_tokens = normalize(pred).split()
+    true_tokens = normalize(true).split()
 
-    # Exact match
-    if pred.strip() == true.strip():
-        exact_match += 1
+    # Normalized match — ignores case and punctuation
+    if normalize(pred) == normalize(true):
+        norm_match += 1
 
-    # Token accuracy (positional)
-    match = sum(p == t for p, t in zip(pred_tokens, true_tokens))
-    token_accs.append(match / max(len(true_tokens), 1))
+    # Contains match — true answer words appear inside prediction
+    # (good for generative models that paraphrase)
+    overlap = sum(1 for t in true_tokens if t in set(pred_tokens))
+    if len(true_tokens) > 0 and overlap / len(true_tokens) >= 0.8:
+        contains_match += 1
 
     # F1
     f1_scores.append(compute_f1(pred_tokens, true_tokens))
@@ -281,17 +301,22 @@ for sample in val_data[:50]:
     all_refs.append(true)
 
 
-em_score  = exact_match / len(val_data[:50])
-token_acc = float(np.mean(token_accs))
-f1_avg    = float(np.mean(f1_scores))
+n = len(val_data[:50])
+norm_acc     = norm_match    / n
+contains_acc = contains_match / n
+f1_avg       = float(np.mean(f1_scores))
 
 # Corpus-level BLEU via sacrebleu (normalized to 0-1)
 bleu_avg = sacrebleu.corpus_bleu(all_preds, [all_refs]).score / 100
 
-print(f"\n✅ Exact Match Accuracy : {em_score:.3f}")
-print(f"✅ Token Accuracy        : {token_acc:.3f}")
+# Overall accuracy = average of contains_acc + f1 (most meaningful for generative QA)
+overall_acc = (contains_acc + f1_avg) / 2
+
+print(f"\n✅ Normalized Match Acc  : {norm_acc:.3f}")
+print(f"✅ Contains Match Acc    : {contains_acc:.3f}  ← best accuracy for generative models")
 print(f"✅ F1 Score              : {f1_avg:.3f}")
 print(f"✅ BLEU Score            : {bleu_avg:.3f}")
+print(f"✅ Overall Accuracy      : {overall_acc:.3f}  ← (Contains + F1) / 2")
 
 
 # SAVE
@@ -305,11 +330,12 @@ results = {
     "model_name": BASE_MODEL,
     "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     "metrics": {
-        "perplexity":     float(perplexity),
-        "exact_match":    float(em_score),
-        "token_accuracy": token_acc,
-        "f1_score":       f1_avg,
-        "bleu_score":     bleu_avg,
+        "perplexity":          float(perplexity),
+        "normalized_match":    float(norm_acc),
+        "contains_match":      float(contains_acc),
+        "f1_score":            f1_avg,
+        "bleu_score":          bleu_avg,
+        "overall_accuracy":    float(overall_acc),
     },
 }
 

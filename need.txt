@@ -28,3 +28,4 @@ else:
     "NousResearch/Meta-Llama-3-8B"
 
     "mistralai/Mistral-7B-v0.1"
+    "NousResearch/Llama-2-7b-chat-hf"
